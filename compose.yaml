@@ -1,0 +1,200 @@
+name: opencode2api
+
+services:
+  # ── Фаза 1. Одноразовый инициализатор (Alpine ~5 МБ) ───────────────────
+  # При ПЕРВОМ запуске генерирует config.json и служебные файлы.
+  # При последующих запусках приводит артефакты к актуальному виду:
+  # создаёт opencode2api.key для подстановки {file:...} в opencode.jsonc
+  # (переменная окружения и connect.ps1 больше не используются).
+  opencode2api-init:
+    image: alpine:3.22
+    restart: "no"
+    volumes:
+      - ./data:/seed
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        if [ -f /seed/config.json ]; then
+          echo "[init] data/config.json уже существует — извлекаю ключ из него"
+          SERVER_KEY=$$(sed -n 's/.*"server_keys": *\["\([^"]*\)".*/\1/p' /seed/config.json)
+          WEBUI_PASS=$$(sed -n 's/.*"password": *"\([^"]*\)".*/\1/p' /seed/config.json)
+          [ -n "$$SERVER_KEY" ] || { echo "[init] server_keys не найден в config.json"; exit 1; }
+        else
+          SERVER_KEY=$$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          WEBUI_PASS=$$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+
+          cat > /seed/config.json <<EOF
+        {
+          "listen": "0.0.0.0:8080",
+          "server_keys": ["$$SERVER_KEY"],
+          "zen_keys": [],
+          "go_keys": [],
+          "anonymous": true,
+          "warp": {
+            "enabled": true,
+            "pool_size": 2,
+            "stack": "ipv6",
+            "source_ipv6": ""
+          },
+          "proxies": ["direct"],
+          "proxyfile": "",
+          "upstream": {
+            "zen": "https://opencode.ai/zen",
+            "go": "https://opencode.ai/zen/go",
+            "anonymous": "https://opencode.ai/inference"
+          },
+          "retry": { "max_attempts": 3, "timeout_seconds": 300 },
+          "models": { "refresh_seconds": 300, "protocols": {}, "free_only": false },
+          "performance": {
+            "max_idle_conns": 2048,
+            "max_idle_conns_per_host": 256,
+            "max_conns_per_host": 0,
+            "idle_conn_timeout_seconds": 120,
+            "connect_timeout_seconds": 5,
+            "failure_cooldown_seconds": 15,
+            "attempt_timeout_seconds": 0,
+            "first_event_timeout_seconds": 0,
+            "max_anonymous_exits": 8,
+            "free_tier_block_seconds": 900
+          },
+          "logging": { "level": "info", "ring_size": 2000, "dump_request_bodies": false },
+          "webui": {
+            "enabled": true,
+            "listen": "0.0.0.0:8081",
+            "username": "admin",
+            "password": "$$WEBUI_PASS",
+            "session_ttl_minutes": 720
+          },
+          "prefer": "go",
+          "reasoning": { "effort": "high", "effort_by_model": {} },
+          "rotation": {
+            "sota": { "alias": "sota", "order": [] },
+            "sweet": { "alias": "sweet", "order": [] },
+            "first_output_seconds": 30
+          }
+        }
+        EOF
+        fi
+
+        # Файл ключа для {file:opencode2api.key} — БЕЗ перевода строки в конце
+        if [ ! -f /seed/opencode2api.key ]; then
+          printf '%s' "$$SERVER_KEY" > /seed/opencode2api.key
+          chmod 600 /seed/opencode2api.key
+          echo "[init] opencode2api.key создан"
+        fi
+
+        # Убираем артефакт старого способа с переменной окружения
+        rm -f /seed/connect.ps1
+
+        # CREDENTIALS.txt: создаём, а также обновляем, если он ещё
+        # описывает старый способ через connect.ps1
+        if [ ! -f /seed/CREDENTIALS.txt ] || grep -q 'connect\.ps1' /seed/CREDENTIALS.txt 2>/dev/null; then
+          cat > /seed/CREDENTIALS.txt <<EOF
+        ============================================
+         opencode2api — сгенерировано автоматически
+        ============================================
+        API-ключ (server_keys):
+          $$SERVER_KEY
+
+        WebUI: http://localhost:38081
+          логин:  admin
+          пароль: $$WEBUI_PASS
+
+        API: http://localhost:38080
+
+        Проверка (PowerShell):
+          curl.exe http://localhost:38080/v1/models -H "Authorization: Bearer $$SERVER_KEY"
+
+        Подключение OpenCode (после того как data/opencode.jsonc появится):
+          1) скопируйте data/opencode.jsonc и data/opencode2api.key
+             в корень проекта (файл ключа должен лежать рядом с opencode.jsonc —
+             подстановка {file:opencode2api.key} ищет его относительно папки конфига)
+          2) перезапустите OpenCode и выберите модель с префиксом opencode2api/
+
+        Если проект под git — добавьте opencode.jsonc и opencode2api.key в .gitignore
+        ============================================
+        EOF
+          chmod 600 /seed/CREDENTIALS.txt
+        fi
+
+        echo "[init] Готово: config.json, opencode2api.key, CREDENTIALS.txt"
+        echo "[init] API-ключ: $$SERVER_KEY"
+
+  # ── Основной шлюз (версия запинена) ────────────────────────────────────
+  opencode2api:
+    image: ghcr.io/jasonxu114514/opencode2api:v1.4.6
+    pull_policy: always
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      opencode2api-init:
+        condition: service_completed_successfully
+    environment:
+      CONFIG_PATH: /var/lib/opencode2api/config.json
+      CONFIG_SEED_PATH: /run/config/config.json
+      LISTEN_ADDRESS: ""
+      WEBUI_LISTEN_ADDRESS: ""
+    ports:
+      - "38080:8080"   # OpenAI/Anthropic-совместимый API (хост-порт 38080)
+      - "38081:8081"   # WebUI (хост-порт 38081)
+    volumes:
+      - ./data:/run/config:ro
+      - opencode2api-state:/var/lib/opencode2api
+    tmpfs:
+      - /tmp
+
+  # ── Фаза 2. Заполнение opencode.jsonc реальными моделями ───────────────
+  # Ждёт готовности шлюза, читает ключ из config.json, опрашивает /v1/models
+  # и пишет готовый opencode.jsonc со всеми доступными моделями.
+  # Ключ клиенту передаётся через {file:opencode2api.key}, без переменных окружения.
+  opencode2api-models:
+    image: alpine:3.22
+    restart: "no"
+    depends_on:
+      opencode2api:
+        condition: service_started
+    volumes:
+      - ./data:/seed
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        if [ -f /seed/opencode.jsonc ]; then
+          echo "[models] opencode.jsonc уже существует — пропуск"
+          exit 0
+        fi
+        if [ ! -f /seed/opencode2api.key ]; then
+          echo "[models] ОШИБКА: data/opencode2api.key не найден — сначала должен отработать opencode2api-init"
+          exit 1
+        fi
+        apk add --no-cache curl jq >/dev/null
+        KEY=$$(jq -r '.server_keys[0]' /seed/config.json)
+
+        # Ждём готовности шлюза (WARP-регистрация может занять пару минут)
+        curl -fsS --retry 40 --retry-all-errors --retry-delay 5 \
+          http://opencode2api:8080/healthz >/dev/null
+
+        curl -fsS http://opencode2api:8080/v1/models \
+          -H "Authorization: Bearer $$KEY" \
+        | jq '{
+            "$$schema": "https://opencode.ai/config.json",
+            providers: {
+              opencode2api: {
+                name: "opencode2api",
+                package: "@opencode/ai/providers/openai-compatible",
+                settings: {
+                  baseURL: "http://localhost:38080/v1",
+                  apiKey: "{file:opencode2api.key}"
+                },
+                models: (.data | map({key: .id, value: {name: .id}}) | from_entries)
+              }
+            }
+          }' > /seed/opencode.jsonc
+
+        N=$$(jq '.providers.opencode2api.models | length' /seed/opencode.jsonc)
+        echo "[models] opencode.jsonc создан, моделей: $$N"
+        jq -r '.providers.opencode2api.models | keys[]' /seed/opencode.jsonc | sed 's/^/  - /'
+
+volumes:
+  opencode2api-state:
