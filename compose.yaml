@@ -1,5 +1,69 @@
 name: opencode2api
 
+# ─────────────────────────────────────────────────────────────────────────────
+# ИСПРАВЛЕННАЯ ВЕРСИЯ: авто-ротация бесплатного (анонимного) режима
+# opencode2api без ключей и подписок.
+#
+# Все правки сверены с исходным кодом jasonxu114514/opencode2api v1.4.6
+# (последний релиз на 01.11.2026) и issue #158.
+#
+# Что изменено:
+#   1) warp.pool_size: 2 → WARP_POOL_SIZE (по умолчанию 8, диапазон 1..32).
+#      Ротация анонимного режима — это смена публичных egress-блоков WARP:
+#      выход, получивший 429/403, немедленно выводится из пула и заменяется
+#      новым. Квота free-tier opencode.ai считается на публичный блок IPv6
+#      /64 за UTC-сутки, поэтому при пуле 2 у вас фактически был 1–2 живых
+#      блока, и лимит исчерпывался почти сразу. 8 выходов = до 8 независимых
+#      суточных квот (сколько разных блоков реально выдаёт Cloudflare,
+#      зависит от коло; дубликаты пул отклоняет сам).
+#   2) warp.source_ipv6 управляется переменной WARP_SOURCE_IPV6 (по
+#      умолчанию пусто). Цитата из исходного кода (internal/warp/pool.go):
+#      «Every exit draws its own address from it, so a replacement reaches
+#      Cloudflare from a new source and receives a new public egress — the
+#      only way past an egress-scoped free usage limit». Если у сервера есть
+#      маршрутизируемый IPv6-блок /64 (типично для VPS) — укажите его в .env,
+#      и каждый выход получит свой публичный egress. На домашнем Windows-хосте
+#      такого блока обычно нет — тогда работает пункт 1 в пределах того,
+#      что выдаёт Cloudflare.
+#   3) models.anonymous_backoff = {threshold: 6, base_hours: 1,
+#      max_hours: 24} — предохранитель анонимной дорожки: после 6 неудач
+#      подряд или блокировки всех выходов дорожка ставится на паузу (1 ч,
+#      далее 2/4/8… максимум 24 ч) и сама восстанавливается полузакрытой
+#      проверкой. Вместо долгого обхода мёртвых выходов на каждый ваш
+#      запрос — быстрый отказ и авто-восстановление (в том числе после
+#      00:00 UTC, когда квота обнуляется).
+#   4) retry.max_attempts: 3 → 5. Для анонимной дорожки это НИЖНЯЯ граница
+#      числа ротаций на один запрос (internal/config/config.go: «For the
+#      anonymous lane it is instead a floor for how many rotating proxies
+#      may be drawn»): запрос успеет перебрать больше свежих выходов,
+#      прежде чем вернуть 429. Ключей нет, на другие лимиты не влияет.
+#   5) Новый one-off сервис opencode2api-apply. КРИТИЧНО: точка входа образа
+#      (docker-entrypoint.sh) импортирует seed-конфиг в state-volume ТОЛЬКО
+#      при первом старте, а init-контейнер не трогает уже существующий
+#      data/config.json — то есть ручные правки data/config.json после
+#      первого запуска НЕ применялись. Apply-сервис при каждом
+#      `docker compose up` переносит настройки ротации в действующий
+#      config.json (data/ и state-volume), не трогая ключи, пароль WebUI и
+#      остальные поля.
+#
+# Применение (для уже развёрнутого стека правки применятся автоматически):
+#   docker compose up -d && docker compose restart opencode2api
+#
+# Переменные (можно задать в .env рядом с compose.yaml):
+#   OPENCODE2API_VERSION — тег образа (по умолчанию v1.4.6 — последний на
+#     01.11.2026; перед сменой проверьте:
+#     https://github.com/jasonxu114514/opencode2api/releases)
+#   WARP_POOL_SIZE       — верхняя граница WARP-выходов, 1..32 (по
+#     умолчанию 8)
+#   WARP_SOURCE_IPV6     — маршрутизируемый IPv6-блок /64 сервера (по
+#     умолчанию пусто)
+#
+# Честное ограничение: квота free-tier — суточный бакет на публичный блок
+# /64 со сбросом в 00:00 UTC (03:00 по Минску). Если потрачены ВСЕ
+# доступные блоки, доступ вернётся только после полуночи UTC. Ротация
+# расширяет число независимых квот, но не отменяет дневной лимит.
+# ─────────────────────────────────────────────────────────────────────────────
+
 services:
   # ── Фаза 1. Одноразовый инициализатор (Alpine ~5 МБ) ───────────────────
   # При ПЕРВОМ запуске генерирует config.json и служебные файлы.
@@ -9,6 +73,9 @@ services:
   opencode2api-init:
     image: alpine:3.22
     restart: "no"
+    environment:
+      WARP_POOL_SIZE: ${WARP_POOL_SIZE:-8}
+      WARP_SOURCE_IPV6: ${WARP_SOURCE_IPV6:-}
     volumes:
       - ./data:/seed
     entrypoint: ["/bin/sh", "-eu", "-c"]
@@ -16,10 +83,13 @@ services:
       - |
         if [ -f /seed/config.json ]; then
           echo "[init] data/config.json уже существует — извлекаю ключ из него"
-          SERVER_KEY=$$(sed -n 's/.*"server_keys": *\["\([^"]*\)".*/\1/p' /seed/config.json)
+          SERVER_KEY=$$(sed -n 's/.*"server_keys": *\["\([^\"]*\)".*/\1/p' /seed/config.json)
           WEBUI_PASS=$$(sed -n 's/.*"password": *"\([^"]*\)".*/\1/p' /seed/config.json)
           [ -n "$$SERVER_KEY" ] || { echo "[init] server_keys не найден в config.json"; exit 1; }
         else
+          case "$$WARP_POOL_SIZE" in ''|*[!0-9]*) echo "[init] WARP_POOL_SIZE должен быть числом 1..32"; exit 1;; esac
+          [ "$$WARP_POOL_SIZE" -ge 1 ] && [ "$$WARP_POOL_SIZE" -le 32 ] || { echo "[init] WARP_POOL_SIZE должен быть 1..32"; exit 1; }
+
           SERVER_KEY=$$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
           WEBUI_PASS=$$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
 
@@ -32,9 +102,9 @@ services:
           "anonymous": true,
           "warp": {
             "enabled": true,
-            "pool_size": 2,
+            "pool_size": $$WARP_POOL_SIZE,
             "stack": "ipv6",
-            "source_ipv6": ""
+            "source_ipv6": "$$WARP_SOURCE_IPV6"
           },
           "proxies": ["direct"],
           "proxyfile": "",
@@ -43,8 +113,13 @@ services:
             "go": "https://opencode.ai/zen/go",
             "anonymous": "https://opencode.ai/inference"
           },
-          "retry": { "max_attempts": 3, "timeout_seconds": 300 },
-          "models": { "refresh_seconds": 300, "protocols": {}, "free_only": false },
+          "retry": { "max_attempts": 5, "timeout_seconds": 300 },
+          "models": {
+            "refresh_seconds": 300,
+            "protocols": {},
+            "free_only": false,
+            "anonymous_backoff": { "threshold": 6, "base_hours": 1, "max_hours": 24 }
+          },
           "performance": {
             "max_idle_conns": 2048,
             "max_idle_conns_per_host": 256,
@@ -111,7 +186,9 @@ services:
              подстановка {file:opencode2api.key} ищет его относительно папки конфига)
           2) перезапустите OpenCode и выберите модель с префиксом opencode2api/
 
-        Если проект под git — добавьте opencode.jsonc и opencode2api.key в .gitignore
+        Настройки ротации (задаются в .env рядом с compose.yaml):
+          WARP_POOL_SIZE=8          — верхняя граница WARP-выходов (1..32)
+          WARP_SOURCE_IPV6=         — ваш маршрутизируемый IPv6-блок /64 (если есть)
         ============================================
         EOF
           chmod 600 /seed/CREDENTIALS.txt
@@ -120,16 +197,69 @@ services:
         echo "[init] Готово: config.json, opencode2api.key, CREDENTIALS.txt"
         echo "[init] API-ключ: $$SERVER_KEY"
 
-  # ── Основной шлюз (версия запинена) ────────────────────────────────────
+  # ── Фаза 1.5. Применение настроек ротации к ДЕЙСТВУЮЩЕМУ конфигу ───────
+  # Seed импортируется в state-volume ТОЛЬКО при первом старте образа
+  # (docker-entrypoint.sh), поэтому правки data/config.json вручную ничего
+  # не меняют. Этот one-off сервис при каждом `docker compose up` переносит
+  # настройки ротации в оба конфига: data/config.json и действующий
+  # config.json внутри state-volume. Ключи, пароль WebUI и остальные поля
+  # не затрагиваются.
+  opencode2api-apply:
+    image: alpine:3.22
+    restart: "no"
+    depends_on:
+      opencode2api-init:
+        condition: service_completed_successfully
+    environment:
+      WARP_POOL_SIZE: ${WARP_POOL_SIZE:-8}
+      WARP_SOURCE_IPV6: ${WARP_SOURCE_IPV6:-}
+    volumes:
+      - ./data:/seed
+      - opencode2api-state:/state
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        apk add --no-cache jq >/dev/null
+
+        POOL="$${WARP_POOL_SIZE:-8}"
+        SRC="$${WARP_SOURCE_IPV6:-}"
+        case "$$POOL" in ''|*[!0-9]*) echo "[apply] WARP_POOL_SIZE должен быть числом 1..32"; exit 1;; esac
+        [ "$$POOL" -ge 1 ] && [ "$$POOL" -le 32 ] || { echo "[apply] WARP_POOL_SIZE должен быть 1..32"; exit 1; }
+
+        patch_file() {
+          F="$$1"
+          if [ ! -f "$$F" ]; then
+            echo "[apply] $$F не найден — пропускаю (будет создан при первом старте шлюза)"
+            return 0
+          fi
+          OWNER=$$(stat -c '%u:%g' "$$F")
+          MODE=$$(stat -c '%a' "$$F")
+          jq --arg src "$$SRC" --argjson pool "$$POOL" '
+            .warp.pool_size = $$pool
+            | .warp.source_ipv6 = $$src
+            | .models.anonymous_backoff = {threshold: 6, base_hours: 1, max_hours: 24}
+            | .retry.max_attempts = 5
+          ' "$$F" > "$$F.tmp"
+          mv "$$F.tmp" "$$F"
+          chown "$$OWNER" "$$F"
+          chmod "$$MODE" "$$F"
+          echo "[apply] $$F: warp.pool_size=$$POOL, warp.source_ipv6='$$SRC', models.anonymous_backoff={threshold:6, base_hours:1, max_hours:24}, retry.max_attempts=5"
+        }
+
+        patch_file /seed/config.json
+        patch_file /state/config.json
+        echo "[apply] Готово"
+
+  # ── Основной шлюз (версия пинена; переопределяется OPENCODE2API_VERSION) ─
   opencode2api:
-    image: ghcr.io/jasonxu114514/opencode2api:v1.4.6
+    image: ghcr.io/jasonxu114514/opencode2api:${OPENCODE2API_VERSION:-v1.4.6}
     pull_policy: always
     restart: unless-stopped
     read_only: true
     security_opt:
       - no-new-privileges:true
     depends_on:
-      opencode2api-init:
+      opencode2api-apply:
         condition: service_completed_successfully
     environment:
       CONFIG_PATH: /var/lib/opencode2api/config.json
