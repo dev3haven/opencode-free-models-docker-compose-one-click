@@ -2,10 +2,11 @@ name: opencode2api
 
 services:
   opencode2api-init:
-    image: alpine:3.22
+    image: alpine:3.24
     restart: "no"
     volumes:
       - ./data:/seed
+      - opencode2api-state:/state
     entrypoint: ["/bin/sh", "-eu", "-c"]
     command:
       - |
@@ -14,7 +15,7 @@ services:
           WEBUI_PASS=$$(sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /seed/config.json)
         else
           SERVER_KEY=$$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
-          WEBUI_PASS=$$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          WEBUI_PASS=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
           cat > /seed/config.json <<EOF
         {
           "listen": "0.0.0.0:8080",
@@ -24,7 +25,7 @@ services:
           "anonymous": true,
           "warp": {
             "enabled": true,
-            "pool_size": 2,
+            "pool_size": 8,
             "stack": "ipv6",
             "source_ipv6": ""
           },
@@ -35,7 +36,7 @@ services:
             "go": "https://opencode.ai/zen/go",
             "anonymous": "https://opencode.ai/inference"
           },
-          "retry": { "max_attempts": 3, "timeout_seconds": 300 },
+          "retry": { "max_attempts": 5, "timeout_seconds": 600 },
           "models": { "refresh_seconds": 300, "protocols": {}, "free_only": false },
           "performance": {
             "max_idle_conns": 2048,
@@ -44,8 +45,8 @@ services:
             "idle_conn_timeout_seconds": 120,
             "connect_timeout_seconds": 5,
             "failure_cooldown_seconds": 15,
-            "attempt_timeout_seconds": 0,
-            "first_event_timeout_seconds": 0,
+            "attempt_timeout_seconds": 60,
+            "first_event_timeout_seconds": 15,
             "max_anonymous_exits": 8,
             "free_tier_block_seconds": 900
           },
@@ -67,6 +68,31 @@ services:
         }
         EOF
         fi
+        sync_gateway_knobs() {
+          [ -f "$$1" ] || return 0
+          sed -e 's/"max_attempts":[[:space:]]*[0-9][0-9]*/"max_attempts": 5/' \
+              -e 's/"timeout_seconds":[[:space:]]*[0-9][0-9]*/"timeout_seconds": 600/' \
+              -e 's/"pool_size":[[:space:]]*[0-9][0-9]*/"pool_size": 8/' \
+              -e 's/"first_event_timeout_seconds":[[:space:]]*[0-9][0-9]*/"first_event_timeout_seconds": 15/' \
+              -e 's/"attempt_timeout_seconds":[[:space:]]*[0-9][0-9]*/"attempt_timeout_seconds": 60/' \
+              "$$1" > /tmp/config.sync && cat /tmp/config.sync > "$$1" && rm -f /tmp/config.sync
+        }
+        sync_gateway_knobs /seed/config.json
+        sync_gateway_knobs /state/config.json
+        check_knob() {
+          grep -Eq "\"$$2\"[[:space:]]*:[[:space:]]*$$3([,}[:space:]]|$$)" "$$1"
+        }
+        for f in /seed/config.json /state/config.json; do
+          [ -f "$$f" ] || continue
+          check_knob "$$f" max_attempts 5 &&
+          check_knob "$$f" timeout_seconds 600 &&
+          check_knob "$$f" pool_size 8 &&
+          check_knob "$$f" first_event_timeout_seconds 15 &&
+          check_knob "$$f" attempt_timeout_seconds 60 || {
+            echo "init: retry/timeout knobs not confirmed in $$f" >&2
+            exit 1
+          }
+        done
         if [ -z "$$SERVER_KEY" ] || [ -z "$$WEBUI_PASS" ]; then
           echo "init: empty key or password" >&2
           exit 1
@@ -110,7 +136,7 @@ services:
       - /tmp
 
   opencode2api-models:
-    image: alpine:3.22
+    image: alpine:3.24
     restart: "no"
     depends_on:
       opencode2api:
