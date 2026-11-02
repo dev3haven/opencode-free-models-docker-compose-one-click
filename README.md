@@ -4,3 +4,7 @@
 2. copy `providers` section from `data/opencode.jsonc` to `c:\Users\user\.config\opencode\opencode.json`
 3. copy `opencode2api.key` file to `c:\Users\user\.config\opencode\` dir
 4. In **opencode** choose a opencode2api model
+
+### Clean all files and configurations, e.g. for a new installation
+
+`docker compose run --rm opencode2api-reset`
