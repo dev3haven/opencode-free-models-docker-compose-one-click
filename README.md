@@ -1,5 +1,5 @@
 ### What is it
-The project can **bypass some limits** of free [OpenCode](https://opencode.ai/) LLM models. It's a wrapper around a [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) project. The main goal of the project is an easy, one-click configuration.
+The project can **bypass some limits** of free [OpenCode](https://opencode.ai/) LLM models. It's a wrapper around a [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) project. The main goal of the project is an **easy configuration**.
 
 ### How to use
 
