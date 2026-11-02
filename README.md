@@ -7,4 +7,4 @@
 
 ### Clean all files and configurations, e.g. for a new installation
 
-`docker compose run --rm opencode2api-reset`
+1. `docker compose run --rm opencode2api-reset`
