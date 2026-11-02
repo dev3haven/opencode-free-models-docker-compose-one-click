@@ -15,7 +15,7 @@ services:
           WEBUI_PASS=$$(sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /seed/config.json)
         else
           SERVER_KEY=$$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
-          WEBUI_PASS=$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          WEBUI_PASS=$$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
           cat > /seed/config.json <<EOF
         {
           "listen": "0.0.0.0:8080",
@@ -36,7 +36,7 @@ services:
             "go": "https://opencode.ai/zen/go",
             "anonymous": "https://opencode.ai/inference"
           },
-          "retry": { "max_attempts": 5, "timeout_seconds": 600 },
+          "retry": { "max_attempts": 8, "timeout_seconds": 600 },
           "models": { "refresh_seconds": 300, "protocols": {}, "free_only": false },
           "performance": {
             "max_idle_conns": 2048,
@@ -70,7 +70,7 @@ services:
         fi
         sync_gateway_knobs() {
           [ -f "$$1" ] || return 0
-          sed -e 's/"max_attempts":[[:space:]]*[0-9][0-9]*/"max_attempts": 5/' \
+          sed -e 's/"max_attempts":[[:space:]]*[0-9][0-9]*/"max_attempts": 8/' \
               -e 's/"timeout_seconds":[[:space:]]*[0-9][0-9]*/"timeout_seconds": 600/' \
               -e 's/"pool_size":[[:space:]]*[0-9][0-9]*/"pool_size": 8/' \
               -e 's/"first_event_timeout_seconds":[[:space:]]*[0-9][0-9]*/"first_event_timeout_seconds": 15/' \
@@ -84,7 +84,7 @@ services:
         }
         for f in /seed/config.json /state/config.json; do
           [ -f "$$f" ] || continue
-          check_knob "$$f" max_attempts 5 &&
+          check_knob "$$f" max_attempts 8 &&
           check_knob "$$f" timeout_seconds 600 &&
           check_knob "$$f" pool_size 8 &&
           check_knob "$$f" first_event_timeout_seconds 15 &&
