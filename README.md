@@ -11,3 +11,21 @@ The project can **bypass some limits** of free [OpenCode](https://opencode.ai/) 
 ### Clean all files and configurations, e.g. for a new installation
 
 1. Run `docker compose run --rm opencode2api-reset`.
+
+***
+
+**IF A MODEL WAS BLOCKED FOR YOUR LOCATION BY IP** you can run OpenCode through a proxy
+
+```bat
+@echo off
+setlocal
+
+set "HTTP_PROXY=http://localhost:31184"
+set "HTTPS_PROXY=http://localhost:31184"
+set "NO_PROXY=localhost,127.0.0.1,::1,0.0.0.0,*.localhost,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16,fe80::/10,fc00::/7,.local,*.local,*.docker.internal,%COMPUTERNAME%"
+
+start "" "%LOCALAPPDATA%\Programs\OpenCode\OpenCode.exe"
+
+endlocal
+exit /b 0
+```
