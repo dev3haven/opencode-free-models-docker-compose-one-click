@@ -1,0 +1,269 @@
+name: opencode2api-proxy-firefox-us
+
+x-proxy-url: &proxy_url http://host.docker.internal:31184
+
+services:
+
+  opencode2api-proxy-firefox-us-init:
+    image: alpine:3.24
+    restart: "no"
+    volumes:
+      - ./data/proxy-firefox-us:/out
+      - opencode2api-proxy-firefox-us-state:/state
+    environment:
+      PROXY_URL: *proxy_url
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        apk add --no-cache jq >/dev/null
+        if [ -f /out/config.json ]; then
+          SERVER_KEY=$$(jq -r '.server_keys[0] // ""' /out/config.json 2>/dev/null || echo '')
+          WEBUI_PASS=$$(jq -r '.webui.password // ""' /out/config.json 2>/dev/null || echo '')
+        else
+          SERVER_KEY=$$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          WEBUI_PASS=$$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')
+          cat > /out/config.json <<EOF
+        {
+          "listen": "0.0.0.0:8080",
+          "server_keys": ["$$SERVER_KEY"],
+          "zen_keys": [],
+          "go_keys": [],
+          "anonymous": true,
+          "warp": {
+            "enabled": false,
+            "pool_size": 8,
+            "stack": "ipv6",
+            "source_ipv6": ""
+          },
+          "proxies": ["$$PROXY_URL"],
+          "proxyfile": "",
+          "upstream": {
+            "zen": "https://opencode.ai/zen",
+            "go": "https://opencode.ai/zen/go",
+            "anonymous": "https://opencode.ai/inference"
+          },
+          "retry": { "max_attempts": 8, "timeout_seconds": 600 },
+          "models": { "refresh_seconds": 300, "protocols": {}, "free_only": false },
+          "performance": {
+            "max_idle_conns": 2048,
+            "max_idle_conns_per_host": 256,
+            "max_conns_per_host": 0,
+            "idle_conn_timeout_seconds": 120,
+            "connect_timeout_seconds": 5,
+            "failure_cooldown_seconds": 15,
+            "attempt_timeout_seconds": 60,
+            "first_event_timeout_seconds": 15,
+            "max_anonymous_exits": 8,
+            "free_tier_block_seconds": 900
+          },
+          "logging": { "level": "info", "ring_size": 2000, "dump_request_bodies": false },
+          "webui": {
+            "enabled": true,
+            "listen": "0.0.0.0:8081",
+            "username": "admin",
+            "password": "$$WEBUI_PASS",
+            "session_ttl_minutes": 720
+          },
+          "prefer": "go",
+          "reasoning": { "effort": "high", "effort_by_model": {} },
+          "rotation": {
+            "sota": { "alias": "sota", "order": [] },
+            "sweet": { "alias": "sweet", "order": [] },
+            "first_output_seconds": 30
+          }
+        }
+        EOF
+        fi
+        sync_gateway_knobs() {
+          [ -f "$$1" ] || return 0
+          sed -e 's/"max_attempts":[[:space:]]*[0-9][0-9]*/"max_attempts": 8/' \
+              -e 's/"timeout_seconds":[[:space:]]*[0-9][0-9]*/"timeout_seconds": 600/' \
+              -e 's/"pool_size":[[:space:]]*[0-9][0-9]*/"pool_size": 8/' \
+              -e 's/"first_event_timeout_seconds":[[:space:]]*[0-9][0-9]*/"first_event_timeout_seconds": 15/' \
+              -e 's/"attempt_timeout_seconds":[[:space:]]*[0-9][0-9]*/"attempt_timeout_seconds": 60/' \
+              "$$1" > /tmp/config.sync && cat /tmp/config.sync > "$$1" && rm -f /tmp/config.sync
+        }
+        sync_gateway_knobs /out/config.json
+        sync_gateway_knobs /state/config.json
+        check_knob() {
+          grep -Eq "\"$$2\"[[:space:]]*:[[:space:]]*$$3([,}[:space:]]|$$)" "$$1"
+        }
+        for f in /out/config.json /state/config.json; do
+          [ -f "$$f" ] || continue
+          check_knob "$$f" max_attempts 8 &&
+          check_knob "$$f" timeout_seconds 600 &&
+          check_knob "$$f" pool_size 8 &&
+          check_knob "$$f" first_event_timeout_seconds 15 &&
+          check_knob "$$f" attempt_timeout_seconds 60 || {
+            echo "opencode2api-proxy-firefox-us-init: retry/timeout knobs not confirmed in $$f" >&2
+            exit 1
+          }
+        done
+        jq -e '(.warp.enabled == false) and (.proxyfile == "") and ((.proxies | length) >= 1) and (.proxies | all(startswith("http://") or startswith("https://") or startswith("socks5://") or startswith("socks5h://") or . == "direct"))' \
+          /out/config.json >/dev/null || {
+            echo "opencode2api-proxy-firefox-us-init: proxy egress not confirmed in /out/config.json" >&2
+            exit 1
+          }
+        if [ -z "$$SERVER_KEY" ] || [ -z "$$WEBUI_PASS" ]; then
+          echo "opencode2api-proxy-firefox-us-init: empty key or password" >&2
+          exit 1
+        fi
+        PROXY=$$(jq -r '.proxies | join(", ")' /out/config.json)
+        printf '%s' "$$SERVER_KEY" > /out/opencode2api-proxy-firefox-us.key
+        cat > /out/CREDENTIALS.txt <<EOF
+        opencode2api-proxy-firefox-us (connections go through proxy: $$PROXY)
+        API key: $$SERVER_KEY
+        API URL: http://localhost:38084
+        WebUI URL: http://localhost:38085
+        WebUI login: admin
+        WebUI password: $$WEBUI_PASS
+        curl.exe http://localhost:38084/v1/models -H "Authorization: Bearer $$SERVER_KEY"
+        opencode: copy opencode.jsonc and opencode2api-proxy-firefox-us.key from data/proxy-firefox-us/ to the project root
+        EOF
+        chmod 600 /out/CREDENTIALS.txt
+        chmod 644 /out/opencode2api-proxy-firefox-us.key
+
+  opencode2api-proxy-firefox-us:
+    image: ghcr.io/jasonxu114514/opencode2api:v1.4.6
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      opencode2api-proxy-firefox-us-init:
+        condition: service_completed_successfully
+    environment:
+      CONFIG_PATH: /var/lib/opencode2api/config.json
+      CONFIG_SEED_PATH: /run/config/config.json
+      LISTEN_ADDRESS: ""
+      WEBUI_LISTEN_ADDRESS: ""
+    ports:
+      - "38084:8080"
+      - "38085:8081"
+    volumes:
+      - ./data/proxy-firefox-us:/run/config:ro
+      - opencode2api-proxy-firefox-us-state:/var/lib/opencode2api
+    tmpfs:
+      - /tmp
+
+  opencode2api-proxy-firefox-us-models:
+    image: alpine:3.24
+    restart: "no"
+    depends_on:
+      opencode2api-proxy-firefox-us:
+        condition: service_started
+    volumes:
+      - ./data:/seed
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        apk add --no-cache curl jq >/dev/null
+        KEY_FILE=/seed/proxy-firefox-us/opencode2api-proxy-firefox-us.key
+        if [ ! -s "$$KEY_FILE" ]; then
+          echo "opencode2api-proxy-firefox-us-models: key file missing or empty: data/proxy-firefox-us/opencode2api-proxy-firefox-us.key (run the init service first)" >&2
+          exit 1
+        fi
+        SERVER_KEY=$$(cat "$$KEY_FILE")
+        echo "opencode2api-proxy-firefox-us-models: waiting for gateway /healthz" >&2
+        curl -fsS --retry 40 --retry-all-errors --retry-delay 5 \
+          http://opencode2api-proxy-firefox-us:8080/healthz >/dev/null
+        echo "opencode2api-proxy-firefox-us-models: polling /v1/models until catalog is ready (the gateway refreshes the catalog every 300 seconds through the configured proxy, this can take several minutes)" >&2
+        i=0
+        while :; do
+          STATUS=$$(curl -sS -o /tmp/models.json -w '%{http_code}' \
+            -H "Authorization: Bearer $$SERVER_KEY" \
+            http://opencode2api-proxy-firefox-us:8080/v1/models 2>/dev/null || true)
+          if [ "$$STATUS" = "200" ] && jq -e '(.data | type) == "array" and (.data | length) > 0' /tmp/models.json >/dev/null 2>&1; then
+            break
+          fi
+          i=$$((i + 1))
+          if [ "$$i" -ge 300 ]; then
+            echo "opencode2api-proxy-firefox-us-models: /v1/models not ready after $$i attempts, last status: $$STATUS" >&2
+            if [ -s /tmp/models.json ]; then
+              echo "opencode2api-proxy-firefox-us-models: last response:" >&2
+              cat /tmp/models.json >&2
+            fi
+            if [ "$$STATUS" = "401" ]; then
+              echo "opencode2api-proxy-firefox-us-models: the key was rejected (401): data/proxy-firefox-us was probably regenerated while the gateway kept the old key in the opencode2api-proxy-firefox-us-state volume; run the reset profile and start the stack again" >&2
+            else
+              echo "opencode2api-proxy-firefox-us-models: the gateway catalog is still empty; make sure the proxy at host.docker.internal:31184 is reachable and check: docker compose logs opencode2api-proxy-firefox-us" >&2
+            fi
+            exit 1
+          fi
+          if [ $$((i % 12)) -eq 1 ]; then
+            echo "opencode2api-proxy-firefox-us-models: waiting for catalog, attempt $$i/300, last status: $$STATUS" >&2
+          fi
+          sleep 5
+        done
+        jq -e '(.data | type) == "array" and (.data | length) > 0' /tmp/models.json >/dev/null || {
+          echo "opencode2api-proxy-firefox-us-models: bad catalog in /tmp/models.json" >&2
+          exit 1
+        }
+        mkdir -p /seed/proxy-firefox-us
+        jq --argjson model_efforts '{
+            "beam-free": {"effort": ["low", "medium", "high", "xhigh", "max"]},
+            "big-pickle": {},
+            "deepseek-v4.1-flash-free": {"toggle": true, "effort": ["low", "high", "max"]},
+            "flint-40b-free": {"effort": ["low", "medium", "high", "xhigh", "max"]},
+            "glm-5.3-flash-free": {"effort": ["low", "high", "max"]},
+            "mimo-v2.6-flash-free": {},
+            "nemotron-3.5-lightning-free": {},
+            "nemotron-3.5-super-vl-free": {"effort": ["none", "minimal", "low", "medium", "high", "xhigh"]},
+            "pulse-alpha-free": {"effort": ["low", "high", "max"]}
+          }' '{
+            "$$schema": "https://opencode.ai/config.json",
+            providers: {
+              "opencode2api-proxy-firefox-us": {
+                name: "opencode2api-proxy-firefox-us",
+                package: "@opencode/ai/providers/openai-compatible",
+                settings: {
+                  baseURL: "http://localhost:38084/v1",
+                  apiKey: "{file:opencode2api-proxy-firefox-us.key}"
+                },
+                models: (.data | map({
+                  key: .id,
+                  value: {
+                    name: .id,
+                    capabilities: {
+                      reasoning: (if .reasoning then
+                        {supported: true} +
+                        (if ($$model_efforts[.id] // null) != null then $$model_efforts[.id]
+                         elif (.reasoning_efforts | length) > 0 then {effort: .reasoning_efforts}
+                         else {} end)
+                      else {supported: false} end)
+                    }
+                  }
+                }) | from_entries)
+              }
+            }
+          }' /tmp/models.json > /tmp/proxy.jsonc
+        [ -s "/tmp/proxy.jsonc" ] || { echo "opencode2api-proxy-firefox-us-models: empty /tmp/proxy.jsonc" >&2; exit 1; }
+        jq -e . /tmp/proxy.jsonc >/dev/null || { echo "opencode2api-proxy-firefox-us-models: invalid JSON in /tmp/proxy.jsonc" >&2; exit 1; }
+        cp /tmp/proxy.jsonc /seed/proxy-firefox-us/.opencode.jsonc.tmp
+        mv -f /seed/proxy-firefox-us/.opencode.jsonc.tmp /seed/proxy-firefox-us/opencode.jsonc
+        echo "opencode2api-proxy-firefox-us-models: wrote data/proxy-firefox-us/opencode.jsonc ($$(wc -c < /seed/proxy-firefox-us/opencode.jsonc) bytes, $$(jq -r '.data | length' /tmp/models.json) models)"
+
+  opencode2api-proxy-firefox-us-reset:
+    image: docker:29.9.2-cli-alpine3.24
+    restart: "no"
+    profiles:
+      - reset
+    network_mode: none
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/seed
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        PROJECT=${COMPOSE_PROJECT_NAME:-opencode2api-proxy-firefox-us}
+        SELF=$$(hostname)
+        docker ps -a --filter "label=com.docker.compose.project=$$PROJECT" --format '{{.ID}} {{.Names}}' | grep -v "^$$SELF" | cut -d' ' -f2- | xargs -r docker rm -f || true
+        docker volume ls -q --filter "label=com.docker.compose.project=$$PROJECT" | xargs -r docker volume rm || true
+        docker network ls --filter "label=com.docker.compose.project=$$PROJECT" --format '{{.Name}}' | xargs -r docker network rm || true
+        rm -rf /seed/proxy-firefox-us || true
+
+volumes:
+  opencode2api-proxy-firefox-us-state:
+
+networks:
+  default:
+    name: opencode2api-proxy-firefox-us
