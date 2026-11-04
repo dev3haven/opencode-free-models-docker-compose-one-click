@@ -12,7 +12,7 @@ The project can **bypass some limits** of free [OpenCode](https://opencode.ai/) 
 
 1. Run `docker compose run --rm opencode2api-reset`.
 
-***
+### A bonus part
 
 **IF A MODEL WAS BLOCKED FOR YOUR LOCATION BY IP** you can run OpenCode through a proxy
 
