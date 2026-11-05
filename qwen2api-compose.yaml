@@ -1,0 +1,263 @@
+name: qwen2api
+
+# Accounts list format: email:password[|proxy_url],email:password[|proxy_url],...
+# Fake example (do not use as-is, proxy part is optional):
+#   user@example.com:not-a-real-password|http://127.0.0.1:7890
+x-qwen-accounts: &qwen_accounts ""
+
+services:
+  qwen2api-init:
+    image: alpine:3.24
+    restart: "no"
+    environment:
+      SEED_ACCOUNTS: *qwen_accounts
+    volumes:
+      - ./data:/out
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        apk add --no-cache jq >/dev/null
+        if [ -f /out/qwen2api.env ]; then
+          KEYS=$$(sed -n 's/^API_KEY=//p' /out/qwen2api.env)
+          ADMIN_KEY=$$(printf '%s' "$$KEYS" | cut -d, -f1)
+          CLIENT_KEY=$$(printf '%s' "$$KEYS" | cut -d, -f2)
+        else
+          ADMIN_KEY="sk-$$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          CLIENT_KEY="sk-$$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        fi
+        if [ -z "$$ADMIN_KEY" ] || [ -z "$$CLIENT_KEY" ]; then
+          echo "init: admin or client key is empty - fix or delete data/qwen2api.env" >&2
+          exit 1
+        fi
+        printf 'API_KEY=%s,%s\n' "$$ADMIN_KEY" "$$CLIENT_KEY" > /out/qwen2api.env
+        printf '%s' "$$CLIENT_KEY" > /out/qwen2api.key
+        cat > /out/CREDENTIALS.txt <<EOF
+        qwen2api one-click (Rfym21/Qwen2API)
+        Admin key (WebUI login): $$ADMIN_KEY
+        API key (opencode and other clients): $$CLIENT_KEY
+        WebUI URL: http://localhost:38090
+        Chat API: http://localhost:38090/v1
+        CLI API (256K context, native tools): http://localhost:38090/cli/v1
+        curl http://localhost:38090/cli/v1/models -H "Authorization: Bearer $$CLIENT_KEY"
+        Accounts: list them in x-qwen-accounts at the top of compose.yaml or add via WebUI
+        opencode: put opencode.jsonc and qwen2api.key from data/ next to your opencode config
+        EOF
+        chmod 600 /out/qwen2api.env /out/CREDENTIALS.txt
+        chmod 644 /out/qwen2api.key
+        echo "init: keys ready (data/qwen2api.env, data/CREDENTIALS.txt)"
+        if [ -n "$${SEED_ACCOUNTS:-}" ]; then
+          if [ -f /out/data.json ]; then
+            jq -e . /out/data.json >/dev/null || {
+              echo "init: data/data.json is not valid JSON - fix or delete it before seeding" >&2
+              exit 1
+            }
+          else
+            printf '{"accounts":[]}' > /out/data.json
+          fi
+          printf '%s' "$$SEED_ACCOUNTS" | jq -R -s '
+            split(",") | map(select((trim | length) > 0))
+            | map(
+                . as $$line
+                | ($$line | split("|") | .[0]) as $$cred
+                | ($$line | split("|") | .[1:] | join("|")) as $$proxy
+                | ($$cred | split(":")) as $$parts
+                | select(($$parts | length) > 1)
+                | ($$parts[0] | trim) as $$email
+                | ($$parts[1:] | join(":") | trim) as $$password
+                | select((($$email | length) > 0) and (($$password | length) > 0))
+                | {
+                    email: $$email,
+                    password: $$password,
+                    proxy: (if ($$proxy | trim | length) > 0 then ($$proxy | trim) else null end)
+                  }
+              )
+          ' > /tmp/seed.json
+          RAW_COUNT=$$(printf '%s' "$$SEED_ACCOUNTS" | jq -R -s 'split(",") | map(select((trim | length) > 0)) | length')
+          SEED_COUNT=$$(jq 'length' /tmp/seed.json)
+          if [ "$$RAW_COUNT" -gt "$$SEED_COUNT" ]; then
+            echo "init: warning: $$(($$RAW_COUNT - $$SEED_COUNT)) bad entrie(s) skipped (format: email:password[|proxy])" >&2
+          fi
+          jq --slurpfile seed /tmp/seed.json '
+            .accounts = (.accounts // [])
+            | reduce ($$seed[0] // [])[] as $$a (
+                .;
+                (.accounts | map(.email) | index($$a.email)) as $$idx
+                | if $$idx == null then
+                    .accounts += [($$a + {token: null, expires: null})]
+                  else
+                    .accounts[$$idx].password = $$a.password
+                    | (if $$a.proxy != null then .accounts[$$idx].proxy = $$a.proxy else . end)
+                  end
+              )
+          ' /out/data.json > /tmp/data.json.new && cat /tmp/data.json.new > /out/data.json && rm -f /tmp/data.json.new
+          chmod 600 /out/data.json
+          jq -r '.[].email' /tmp/seed.json | sed 's/^/init: seeded account: /'
+          echo "init: $$SEED_COUNT account(s) upserted into data/data.json"
+        else
+          echo "init: account list is empty - add accounts in x-qwen-accounts or via WebUI"
+        fi
+
+  qwen2api:
+    image: rfym21/qwen2api:v26.10.19.00.34
+    restart: always
+    depends_on:
+      qwen2api-init:
+        condition: service_completed_successfully
+        restart: true
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        if [ ! -s /app/data/qwen2api.env ]; then
+          echo "qwen2api: data/qwen2api.env not found - qwen2api-init must run first" >&2
+          exit 1
+        fi
+        set -a
+        . /app/data/qwen2api.env
+        set +a
+        if [ -z "$${API_KEY:-}" ]; then
+          echo "qwen2api: API_KEY is empty in data/qwen2api.env" >&2
+          exit 1
+        fi
+        exec /usr/local/bin/qwen2api
+    ports:
+      - "38090:3000"
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./caches:/app/caches
+    environment:
+      SERVICE_PORT: "3000"
+      LISTEN_ADDRESS: ""
+      DATA_SAVE_MODE: file
+      CACHE_MODE: file
+      ENABLE_CLI: "true"
+      SEARCH_INFO_MODE: table
+      OUTPUT_THINK: "true"
+      LEGACY_REASONING_IN_CONTENT: "false"
+      SIMPLE_MODEL_MAP: "false"
+      MODELS_CACHE_TTL: "3600"
+      ACCOUNTS: "${ACCOUNTS:-}"
+      PROXY_URL: "${PROXY_URL:-}"
+      SEED_ACCOUNTS: *qwen_accounts
+
+  qwen2api-models:
+    image: alpine:3.24
+    restart: "no"
+    depends_on:
+      qwen2api:
+        condition: service_started
+    volumes:
+      - ./data:/seed
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        apk add --no-cache curl jq >/dev/null
+        KEY=$$(cat /seed/qwen2api.key)
+        BASE=http://qwen2api:3000
+        CATALOG_READY=0
+        TRIES=0
+        while [ "$$TRIES" -lt 36 ]; do
+          if curl -fsS "$$BASE/v1/models" -H "Authorization: Bearer $$KEY" > /tmp/models.json 2>/dev/null; then
+            COUNT=$$(jq -r '.data | length' /tmp/models.json 2>/dev/null || echo 0)
+            if [ "$${COUNT:-0}" -gt 0 ]; then
+              CATALOG_READY=1
+              break
+            fi
+          fi
+          TRIES=$$((TRIES + 1))
+          sleep 5
+        done
+        if [ "$$CATALOG_READY" -ne 1 ]; then
+          echo "models: chat catalog is empty (no accounts yet) - add accounts via WebUI, then re-run: docker compose run --rm qwen2api-models" >&2
+          printf '{"object":"list","data":[]}' > /tmp/models.json
+        fi
+        curl -fsS --retry 40 --retry-all-errors --retry-delay 5 \
+          "$$BASE/cli/v1/models" -H "Authorization: Bearer $$KEY" > /tmp/cli-models.json
+        jq -e '(.data | type) == "array"' /tmp/models.json >/dev/null || {
+          echo "models: bad catalog in /tmp/models.json" >&2
+          exit 1
+        }
+        jq -e '(.data | type) == "array" and (.data | length) > 0' /tmp/cli-models.json >/dev/null || {
+          echo "models: bad CLI catalog in /tmp/cli-models.json" >&2
+          exit 1
+        }
+        jq --slurpfile cli /tmp/cli-models.json '{
+            "$$schema": "https://opencode.ai/config.json",
+            providers: {
+              "qwen2api": {
+                name: "qwen2api",
+                package: "@opencode/ai/providers/openai-compatible",
+                settings: {
+                  baseURL: "http://localhost:38090/v1",
+                  apiKey: "{file:qwen2api.key}"
+                },
+                models: ([.data[]
+                  | select(.id | test("-(image|video|image-edit)$") | not)
+                  | {
+                      key: .id,
+                      value: {
+                        name: .id,
+                        capabilities: {
+                          reasoning: (if (.id | test("-thinking")) then
+                            {supported: true}
+                          else
+                            {supported: false}
+                          end)
+                        }
+                      }
+                    }] | from_entries)
+              },
+              "qwen2api-cli": {
+                name: "qwen2api-cli",
+                package: "@opencode/ai/providers/openai-compatible",
+                settings: {
+                  baseURL: "http://localhost:38090/cli/v1",
+                  apiKey: "{file:qwen2api.key}"
+                },
+                models: ([$$cli[0].data[]
+                  | {
+                      key: .id,
+                      value: {
+                        name: .id,
+                        capabilities: {
+                          reasoning: {supported: false}
+                        }
+                      }
+                    }] | from_entries)
+              }
+            }
+          }' /tmp/models.json > /tmp/opencode.jsonc
+        jq -e . /tmp/opencode.jsonc >/dev/null || {
+          echo "models: invalid JSON in /tmp/opencode.jsonc" >&2
+          exit 1
+        }
+        cp /tmp/opencode.jsonc /seed/opencode.jsonc
+        echo "models: chat catalog ($$(jq '.data | length' /tmp/models.json) models):"
+        jq -r '.data[].id' /tmp/models.json | sed 's/^/  - /'
+        echo "models: cli catalog ($$(jq '.data | length' /tmp/cli-models.json) models):"
+        jq -r '.data[].id' /tmp/cli-models.json | sed 's/^/  - /'
+        echo "models: wrote data/opencode.jsonc ($$(wc -c < /seed/opencode.jsonc) bytes)"
+        echo "models: re-run after changing accounts or upstream models: docker compose run --rm qwen2api-models"
+
+  qwen2api-reset:
+    image: docker:29.9.2-cli-alpine3.24
+    restart: "no"
+    profiles:
+      - reset
+    network_mode: none
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/seed
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        PROJECT=$${COMPOSE_PROJECT_NAME:-qwen2api}
+        SELF=$$(hostname)
+        docker ps -a --filter "label=com.docker.compose.project=$$PROJECT" --format '{{.ID}} {{.Names}}' | grep -v "^$$SELF" | cut -d' ' -f2- | xargs -r docker rm -f || true
+        docker volume ls -q --filter "label=com.docker.compose.project=$$PROJECT" | xargs -r docker volume rm || true
+        docker network ls --filter "label=com.docker.compose.project=$$PROJECT" --format '{{.Name}}' | xargs -r docker network rm || true
+        rm -rf /seed/* /seed/.[!.]* /seed/..?* || true
+
+networks:
+  default:
+    name: qwen2api
