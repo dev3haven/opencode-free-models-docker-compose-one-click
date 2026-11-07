@@ -12,6 +12,11 @@ The project can **bypass some limits** of free [OpenCode](https://opencode.ai/) 
 
 1. Run `docker compose run --rm opencode2api-reset`.
 
+### `requesty2api-naga2api-compose.yaml`
+1. Go to https://app.requesty.ai and sign up/in
+2. create an api key and paste it to the `requesty2api-naga2api-compose.yaml`
+3. Do the same with https://naga.ac
+
 ### A bonus part
 
 **IF A MODEL WAS BLOCKED FOR YOUR LOCATION BY IP** you can run OpenCode through a proxy
