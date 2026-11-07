@@ -1,21 +1,21 @@
 ### What is it
 The project can **bypass some limits** of free [OpenCode](https://opencode.ai/) LLM models. It's a wrapper around a [jasonxu114514/opencode2api](https://github.com/jasonxu114514/opencode2api) project. The main goal of the project is an **easy configuration**.
 
-### How to use
+### `opencode2api-compose.yaml`
 
 1. Run `docker compose -f ./blabla/compose.yml up`. It will create `data/` dir near the `compose.yml` file with config files.
 2. Copy `providers` (an **opencode2api** block) section from `data/opencode.jsonc` to `c:\Users\user\.config\opencode\opencode.json`.
 3. Copy `opencode2api.key` file to `c:\Users\user\.config\opencode\` dir.
 4. In **opencode** choose an **opencode2api** model.
 
-### Clean all files and configurations, e.g. for a new installation
-
-1. Run `docker compose run --rm opencode2api-reset`.
-
 ### `requesty2api-naga2api-compose.yaml`
 1. Go to https://app.requesty.ai and sign up/in
 2. create an api key and paste it to the `requesty2api-naga2api-compose.yaml`
 3. Do the same with https://naga.ac
+
+### Clean up
+
+- Run `docker compose run --rm xxxxxxx-reset` from a `compose.yaml`.
 
 ### A bonus part
 
