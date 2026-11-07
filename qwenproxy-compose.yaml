@@ -1,0 +1,179 @@
+name: qwenproxy
+
+x-qwen-accounts: &qwen_accounts |-
+    example@gmail.com:MY_PASSWORD
+
+services:
+  qwenproxy-init:
+    image: alpine:3.24
+    restart: "no"
+    volumes:
+      - ./data:/out
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        if [ -f /out/qwenproxy.env ]; then
+          API_KEY=$$(sed -n 's/^API_KEY=//p' /out/qwenproxy.env)
+        else
+          API_KEY="sk-$$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+        fi
+        if [ -z "$$API_KEY" ]; then
+          echo "init: api key is empty - fix or delete data/qwenproxy.env" >&2
+          exit 1
+        fi
+        printf 'API_KEY=%s\n' "$$API_KEY" > /out/qwenproxy.env
+        printf '%s' "$$API_KEY" > /out/qwenproxy.key
+        cat > /out/CREDENTIALS.txt <<EOF
+        qwenproxy one-click (johngbl/qwenproxy)
+        API key (server auth; opencode and other clients): $$API_KEY
+        Chat API: http://localhost:38090/v1
+        Anthropic API (Claude Code): http://localhost:38090/v1/messages
+        curl http://localhost:38090/v1/models -H "Authorization: Bearer $$API_KEY"
+        Accounts: list them in x-qwen-accounts at the top of compose.yaml
+        Account format: email:password - no per-account proxy, no token support
+        Claude Code: qpx sync claude on the host, or export ANTHROPIC_BASE_URL=http://localhost:38090 with the API key above
+        opencode: put opencode.jsonc and qwenproxy.key from data/ next to your opencode config
+        EOF
+        chmod 600 /out/qwenproxy.env /out/CREDENTIALS.txt
+        chmod 644 /out/qwenproxy.key
+        echo "init: key ready (data/qwenproxy.env, data/CREDENTIALS.txt)"
+
+  qwenproxy:
+    image: ghcr.io/your-username/qwenproxy:v1.6.11
+    restart: always
+    depends_on:
+      qwenproxy-init:
+        condition: service_completed_successfully
+        restart: true
+    shm_size: "2gb"
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        if [ ! -s /app/data/qwenproxy.env ]; then
+          echo "qwenproxy: data/qwenproxy.env not found - qwenproxy-init must run first" >&2
+          exit 1
+        fi
+        set -a
+        . /app/data/qwenproxy.env
+        set +a
+        if [ -z "$${API_KEY:-}" ]; then
+          echo "qwenproxy: API_KEY is empty in data/qwenproxy.env" >&2
+          exit 1
+        fi
+        exec /usr/bin/dumb-init -- /app/docker-entrypoint.sh npx tsx src/index.ts
+    ports:
+      - "38090:7936"
+    volumes:
+      - ./data:/app/data
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "7936"
+      PLAYWRIGHT_HEADLESS: "true"
+      QWEN_ACCOUNTS: *qwen_accounts
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:7936/health').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  qwenproxy-models:
+    image: alpine:3.24
+    restart: "no"
+    depends_on:
+      qwenproxy:
+        condition: service_started
+    volumes:
+      - ./data:/seed
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        apk add --no-cache curl jq >/dev/null
+        KEY=$$(cat /seed/qwenproxy.key)
+        BASE=http://qwenproxy:7936
+        CATALOG_READY=0
+        TRIES=0
+        while [ "$$TRIES" -lt 36 ]; do
+          if curl -fsS "$$BASE/v1/models" -H "Authorization: Bearer $$KEY" > /tmp/models.json 2>/dev/null; then
+            COUNT=$$(jq -r '.data | length' /tmp/models.json 2>/dev/null || echo 0)
+            if [ "$${COUNT:-0}" -gt 0 ]; then
+              CATALOG_READY=1
+              break
+            fi
+          fi
+          TRIES=$$((TRIES + 1))
+          sleep 5
+        done
+        if [ "$$CATALOG_READY" -ne 1 ]; then
+          echo "models: chat catalog is empty (no working accounts yet) - add accounts in x-qwen-accounts, then re-run: docker compose run --rm qwenproxy-models" >&2
+          printf '{"object":"list","data":[]}' > /tmp/models.json
+        fi
+        jq -e '(.data | type) == "array"' /tmp/models.json >/dev/null || {
+          echo "models: bad catalog in /tmp/models.json" >&2
+          exit 1
+        }
+        jq '{
+            "$$schema": "https://opencode.ai/config.json",
+            providers: {
+              "qwenproxy": {
+                name: "qwenproxy",
+                package: "@opencode/ai/providers/openai-compatible",
+                settings: {
+                  baseURL: "http://localhost:38090/v1",
+                  apiKey: "{file:qwenproxy.key}"
+                },
+                models: ([.data[]
+                  | select(.id | test("-(image|video|image-edit)$") | not)
+                  | {
+                      key: .id,
+                      value: {
+                        name: .id,
+                        capabilities: {
+                          reasoning: (if (.id | test("-thinking")) then
+                            {supported: true}
+                          else
+                            {supported: false}
+                          end)
+                        }
+                      }
+                    }] | from_entries)
+              }
+            }
+          }' /tmp/models.json > /tmp/opencode.jsonc
+        jq -e . /tmp/opencode.jsonc >/dev/null || {
+          echo "models: invalid JSON in /tmp/opencode.jsonc" >&2
+          exit 1
+        }
+        cp /tmp/opencode.jsonc /seed/opencode.jsonc
+        echo "models: chat catalog ($$(jq '.data | length' /tmp/models.json) models):"
+        jq -r '.data[].id' /tmp/models.json | sed 's/^/  - /'
+        echo "models: wrote data/opencode.jsonc ($$(wc -c < /seed/opencode.jsonc) bytes)"
+        echo "models: re-run after changing accounts or upstream models: docker compose run --rm qwenproxy-models"
+
+  qwenproxy-reset:
+    image: docker:29.9.2-cli-alpine3.24
+    restart: "no"
+    profiles:
+      - reset
+    network_mode: none
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./data:/seed
+    entrypoint: ["/bin/sh", "-eu", "-c"]
+    command:
+      - |
+        PROJECT=$${COMPOSE_PROJECT_NAME:-qwenproxy}
+        SELF=$$(hostname)
+        docker ps -a --filter "label=com.docker.compose.project=$$PROJECT" --format '{{.ID}} {{.Names}}' | grep -v "^$$SELF" | cut -d' ' -f2- | xargs -r docker rm -f || true
+        docker volume ls -q --filter "label=com.docker.compose.project=$$PROJECT" | xargs -r docker volume rm || true
+        docker network ls --filter "label=com.docker.compose.project=$$PROJECT" --format '{{.Name}}' | xargs -r docker network rm || true
+        rm -rf /seed/* /seed/.[!.]* /seed/..?* || true
+
+networks:
+  default:
+    name: qwenproxy
