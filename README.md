@@ -8,6 +8,10 @@ The project can **bypass some limits** of free [OpenCode](https://opencode.ai/) 
 3. Copy `opencode2api.key` file to `c:\Users\user\.config\opencode\` dir.
 4. In **opencode** choose an **opencode2api** model.
 
+### `opencode2api-proxy-example-compose.yaml`
+1. It is the same as `opencode2api-compose.yaml` but with an example for proxy.
+2. Replace with your login-password-proxy.
+
 ### `qwen2api-qwenproxy-compose.yaml`
 
 1. Go to https://chat.qwen.ai and sign up.
