@@ -8,10 +8,18 @@ The project can **bypass some limits** of free [OpenCode](https://opencode.ai/) 
 3. Copy `opencode2api.key` file to `c:\Users\user\.config\opencode\` dir.
 4. In **opencode** choose an **opencode2api** model.
 
+### `qwen2api-qwenproxy-compose.yaml`
+
+1. Go to https://chat.qwen.ai and sign up.
+2. Paste these login-password pairs to `qwen2api-qwenproxy-compose.yaml`.
+3. Run `docker compose up`, copy a provider from `data/opencode.jsonc to `c:\Users\user\.config\opencode\opencode.json`.
+
 ### `requesty2api-naga2api-compose.yaml`
-1. Go to https://app.requesty.ai and sign up/in
-2. create an api key and paste it to the `requesty2api-naga2api-compose.yaml`
+
+1. Go to https://app.requesty.ai and sign up/in.
+2. Create an api key and paste it to the `requesty2api-naga2api-compose.yaml`.
 3. Do the same with https://naga.ac
+4. Run `docker compose up`, copy a provider from `data/opencode.jsonc to `c:\Users\user\.config\opencode\opencode.json`.
 
 ### Clean up
 
