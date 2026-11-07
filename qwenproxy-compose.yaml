@@ -1,7 +1,9 @@
 name: qwenproxy
 
 x-qwen-accounts: &qwen_accounts |-
-    example@gmail.com:MY_PASSWORD
+    example_1@example.com:MY_PASSWORD_1
+    example_2@example.com:MY_PASSWORD_2
+    example_3@example.com:MY_PASSWORD_3
 
 services:
   qwenproxy-init:
@@ -39,7 +41,7 @@ services:
         echo "init: key ready (data/qwenproxy.env, data/CREDENTIALS.txt)"
 
   qwenproxy:
-    image: ghcr.io/your-username/qwenproxy:v1.6.11
+    image: ghcr.io/dev3haven/qwenproxy:v1.6.11
     restart: always
     depends_on:
       qwenproxy-init:
