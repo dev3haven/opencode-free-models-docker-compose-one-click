@@ -101,7 +101,8 @@ services:
         CATALOG_READY=0
         TRIES=0
         while [ "$$TRIES" -lt 36 ]; do
-          if curl -fsS "$$BASE/v1/models" -H "Authorization: Bearer $$KEY" > /tmp/models.json 2>/dev/null; then
+          if curl -fsS "$$BASE/v1/models" -H "Authorization: Bearer $$KEY" > /tmp/models_raw.json 2>/dev/null \
+             && curl -fsS "$$BASE/v1/models" -H "Authorization: Bearer $$KEY" -H "anthropic-version: 2023-06-01" > /tmp/models.json 2>/dev/null; then
             COUNT=$$(jq -r '.data | length' /tmp/models.json 2>/dev/null || echo 0)
             if [ "$${COUNT:-0}" -gt 0 ]; then
               CATALOG_READY=1
@@ -112,49 +113,70 @@ services:
           sleep 5
         done
         if [ "$$CATALOG_READY" -ne 1 ]; then
-          echo "models: chat catalog is empty (no working accounts yet) - add accounts in x-qwen-accounts, then re-run: docker compose run --rm qwenproxy-models" >&2
-          printf '{"object":"list","data":[]}' > /tmp/models.json
+          echo "models: catalog is empty (no working accounts yet) - add accounts in x-qwen-accounts, then re-run: docker compose run --rm qwenproxy-models" >&2
+          exit 1
         fi
-        jq -e '(.data | type) == "array"' /tmp/models.json >/dev/null || {
-          echo "models: bad catalog in /tmp/models.json" >&2
+        jq -e '(.data | type) == "array"' /tmp/models_raw.json >/dev/null || {
+          echo "models: bad catalog in /tmp/models_raw.json" >&2
           exit 1
         }
-        jq '{
-            "$$schema": "https://opencode.ai/config.json",
-            providers: {
-              "qwenproxy": {
-                name: "qwenproxy",
-                package: "@opencode/ai/providers/openai-compatible",
-                settings: {
-                  baseURL: "http://localhost:38090/v1",
-                  apiKey: "{file:qwenproxy.key}"
-                },
-                models: ([.data[]
-                  | select(.id | test("-(image|video|image-edit)$") | not)
-                  | {
-                      key: .id,
-                      value: {
-                        name: .id,
-                        capabilities: {
-                          reasoning: (if (.id | test("-thinking")) then
-                            {supported: true}
-                          else
-                            {supported: false}
-                          end)
+        LIVE_COUNT=$$(jq '[.data[] | select((keys - ["id","object","created","owned_by","media_generation","media_modes","media_reference_required"]) | length > 0)] | length' /tmp/models_raw.json)
+        if [ "$${LIVE_COUNT:-0}" -eq 0 ]; then
+          echo "models: server returned the upstream FALLBACK model list (live account catalog unavailable - browser/WAF not ready). Nothing written. Re-run later: docker compose run --rm qwenproxy-models" >&2
+          exit 1
+        fi
+        jq -n --slurpfile raw /tmp/models_raw.json --slurpfile ant /tmp/models.json '
+          ([ $$raw[0].data[] | select((keys - ["id","object","created","owned_by","media_generation","media_modes","media_reference_required"]) | length > 0) | .id ]) as $$live
+          | {
+              "$$schema": "https://opencode.ai/config.json",
+              providers: {
+                "qwenproxy": {
+                  name: "qwenproxy",
+                  package: "@opencode/ai/providers/openai-compatible",
+                  settings: {
+                    baseURL: "http://localhost:38090/v1",
+                    apiKey: "{file:qwenproxy.key}"
+                  },
+                  models: ([ $$ant[0].data[]
+                    | select(.id as $$id | $$live | index($$id))
+                    | {
+                        key: .id,
+                        value: {
+                          name: (.display_name // .id),
+                          type: (if (.id | test("image|video|-(t2v|i2v)$")) then "image" else "chat" end),
+                          capabilities: {
+                            tools: (if (.id | test("image|video|-(t2v|i2v)$")) then false else true end),
+                            input: (["text"]
+                              + (if (.capabilities.image_input.supported // false) then ["image"] else [] end)
+                              + (if (.capabilities.pdf_input.supported // false) then ["pdf"] else [] end)
+                              + (if (.capabilities.audio_input.supported // false) then ["audio"] else [] end)
+                              + (if (.capabilities.video_input.supported // false) then ["video"] else [] end)),
+                            output: (if (.id | test("image")) then ["image"]
+                              elif (.id | test("video|-(t2v|i2v)$")) then ["video"]
+                              else ["text"] end),
+                            reasoning: (if (.capabilities.thinking.supported // false)
+                              then {supported: true, effort: ["low", "medium", "high"]}
+                              else {supported: false}
+                            end)
+                          },
+                          limit: {
+                            context: .max_input_tokens,
+                            output: .max_tokens
+                          }
                         }
-                      }
-                    }] | from_entries)
+                      }] | from_entries)
+                }
               }
-            }
-          }' /tmp/models.json > /tmp/opencode.jsonc
+            }' > /tmp/opencode.jsonc
         jq -e . /tmp/opencode.jsonc >/dev/null || {
           echo "models: invalid JSON in /tmp/opencode.jsonc" >&2
           exit 1
         }
         cp /tmp/opencode.jsonc /seed/opencode.jsonc
-        echo "models: chat catalog ($$(jq '.data | length' /tmp/models.json) models):"
-        jq -r '.data[].id' /tmp/models.json | sed 's/^/  - /'
-        echo "models: wrote data/opencode.jsonc ($$(wc -c < /seed/opencode.jsonc) bytes)"
+        cp /tmp/models_raw.json /seed/models.json
+        echo "models: live catalog ($$LIVE_COUNT models):"
+        jq -r '[.data[] | select((keys - ["id","object","created","owned_by","media_generation","media_modes","media_reference_required"]) | length > 0) | .id] | .[]' /tmp/models_raw.json | sed 's/^/  - /'
+        echo "models: wrote data/opencode.jsonc ($$(wc -c < /seed/opencode.jsonc) bytes) and raw catalog data/models.json"
         echo "models: re-run after changing accounts or upstream models: docker compose run --rm qwenproxy-models"
 
   qwenproxy-reset:
