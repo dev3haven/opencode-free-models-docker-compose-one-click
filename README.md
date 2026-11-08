@@ -23,7 +23,7 @@ The project can **bypass some limits** of free [OpenCode](https://opencode.ai/) 
 1. Go to https://app.requesty.ai and sign up/in.
 2. Create an api key and paste it to the `requesty2api-naga2api-compose.yaml`.
 3. Do the same with https://naga.ac
-4. Run `docker compose up`, copy a provider from `data/opencode.jsonc to `c:\Users\user\.config\opencode\opencode.json`.
+4. Run `docker compose up`, copy a provider from `data/opencode.jsonc` to `c:\Users\user\.config\opencode\opencode.json`.
 
 ### Clean up
 
