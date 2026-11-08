@@ -10,7 +10,7 @@ on:
         required: false
         default: ""
       force:
-        description: "Rebuild even if the tag already exists in GHCR"
+        description: "Build a new tagged version even if the image is unchanged"
         type: boolean
         required: false
         default: false
@@ -29,11 +29,13 @@ env:
 
 jobs:
   resolve:
-    name: Resolve upstream ref
+    name: Resolve upstream ref and next tag
     runs-on: ubuntu-24.04
     outputs:
       ref: ${{ steps.ref.outputs.ref }}
-      exists: ${{ steps.exists.outputs.exists }}
+      tag: ${{ steps.next.outputs.tag }}
+      fingerprint: ${{ steps.fp.outputs.fingerprint }}
+      skip: ${{ steps.next.outputs.skip }}
       owner_lc: ${{ steps.owner.outputs.owner_lc }}
     steps:
       - name: Lowercase owner
@@ -41,6 +43,9 @@ jobs:
         env:
           OWNER: ${{ github.repository_owner }}
         run: echo "owner_lc=${OWNER,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
 
       - name: Resolve upstream ref
         id: ref
@@ -61,6 +66,21 @@ jobs:
           echo "ref=$REF" >> "$GITHUB_OUTPUT"
           echo "Latest upstream release: $REF"
 
+      - name: Compute build fingerprint
+        id: fp
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF: ${{ steps.ref.outputs.ref }}
+        run: |
+          UPSTREAM_SHA="$(gh api "repos/${UPSTREAM}/commits/${REF}" --jq .sha)"
+          if [ -z "$UPSTREAM_SHA" ]; then
+            echo "Failed to resolve commit for ${UPSTREAM} ${REF}" >&2
+            exit 1
+          fi
+          DOCKERFILE_SHA="$(sha256sum docker/qwenproxy-slim/Dockerfile | cut -d' ' -f1)"
+          FINGERPRINT="$(printf '%s %s' "$UPSTREAM_SHA" "$DOCKERFILE_SHA" | sha256sum | cut -d' ' -f1)"
+          echo "fingerprint=$FINGERPRINT" >> "$GITHUB_OUTPUT"
+
       - name: Login to GHCR
         uses: docker/login-action@v4.8.0
         with:
@@ -68,23 +88,53 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check tag in GHCR
-        id: exists
-        if: ${{ !inputs.force }}
+      - name: Resolve next tag suffix
+        id: next
         env:
-          IMAGE_REF: ghcr.io/${{ steps.owner.outputs.owner_lc }}/${{ env.IMAGE }}:${{ steps.ref.outputs.ref }}
+          GH_TOKEN: ${{ github.token }}
+          OWNER: ${{ github.repository_owner }}
+          OWNER_LC: ${{ steps.owner.outputs.owner_lc }}
+          REF: ${{ steps.ref.outputs.ref }}
+          FINGERPRINT: ${{ steps.fp.outputs.fingerprint }}
+          FORCE: ${{ inputs.force }}
         run: |
-          if docker manifest inspect "$IMAGE_REF" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Image $IMAGE_REF already exists - skipping"
+          OWNER_TYPE="$(gh api "users/${OWNER}" --jq .type)"
+          if [ "$OWNER_TYPE" = "Organization" ]; then
+            API_PATH="/orgs/${OWNER}/packages/container/${IMAGE}/versions"
           else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
+            API_PATH="/user/packages/container/${IMAGE}/versions"
+          fi
+          LAST_N="$(gh api --paginate "$API_PATH" \
+            | jq -s --arg ref "$REF" '
+                add
+                | [ .[]
+                    | (.metadata.container.tags // [])[]
+                    | select(startswith($ref + "-"))
+                    | select((ltrimstr($ref + "-")) | test("^[0-9]+$"))
+                    | (ltrimstr($ref + "-") | tonumber)
+                  ]
+                | max // 0')"
+          if [ "$LAST_N" -eq 0 ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "tag=${REF}-1" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          IMAGE_REF="ghcr.io/${OWNER_LC}/${IMAGE}:${REF}-${LAST_N}"
+          LAST_FP="$(docker buildx imagetools inspect "$IMAGE_REF" --format '{{json .Image.Config.Labels}}' \
+            | jq -r '."org.opencontainers.image.revision" // ""')"
+          if [ "$FORCE" = "true" ] || [ "$LAST_FP" != "$FINGERPRINT" ]; then
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "tag=${REF}-$((LAST_N + 1))" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "tag=${REF}-${LAST_N}" >> "$GITHUB_OUTPUT"
+            echo "Image ${IMAGE_REF} is identical to the current build - skipping"
           fi
 
   build:
     name: Build and push
     needs: resolve
-    if: ${{ needs.resolve.outputs.exists != 'true' }}
+    if: ${{ needs.resolve.outputs.skip != 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -112,10 +162,11 @@ jobs:
           build-args: |
             UPSTREAM_REF=${{ needs.resolve.outputs.ref }}
           tags: |
-            ghcr.io/${{ needs.resolve.outputs.owner_lc }}/${{ env.IMAGE }}:${{ needs.resolve.outputs.ref }}
+            ghcr.io/${{ needs.resolve.outputs.owner_lc }}/${{ env.IMAGE }}:${{ needs.resolve.outputs.tag }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ needs.resolve.outputs.ref }}
+            org.opencontainers.image.version=${{ needs.resolve.outputs.tag }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.fingerprint }}
             org.opencontainers.image.description=Built from ${{ env.UPSTREAM }} ${{ needs.resolve.outputs.ref }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
