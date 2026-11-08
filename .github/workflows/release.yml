@@ -42,10 +42,18 @@ jobs:
       - name: Parse pinned version from compose
         run: |
           set -euo pipefail
-          COMPOSE_FILE=$(ls compose.yaml compose.yml docker-compose.yaml docker-compose.yml 2>/dev/null | head -n 1)
-          [ -n "$COMPOSE_FILE" ] || { echo "compose file not found" >&2; exit 1; }
-          IMAGE_REF=$(grep -oE "ghcr\.io/[^\"'[:space:]]+" "$COMPOSE_FILE" | head -n 1)
-          [ -n "$IMAGE_REF" ] || { echo "ghcr.io image ref not found in $COMPOSE_FILE" >&2; exit 1; }
+          mapfile -t REFS < <(
+            grep -rohE "ghcr\.io/[^\"'[:space:]]+:v[0-9][^\"'[:space:]]*" \
+              --include="*.yml" --include="*.yaml" \
+              --exclude-dir=".git" --exclude-dir=".github" \
+              . 2>/dev/null | sort -u
+          )
+          if [ "${#REFS[@]}" -eq 0 ]; then
+            echo "no pinned ghcr.io image ref (ghcr.io/...:v...) found in any yml/yaml file" >&2
+            exit 1
+          fi
+          echo "found refs: ${REFS[*]}"
+          IMAGE_REF="${REFS[0]}"
           IMAGE="${IMAGE_REF%:*}"
           BASE="${IMAGE_REF##*:}"
           case "$BASE" in
@@ -61,6 +69,7 @@ jobs:
       - name: Build candidate
         run: |
           set -euo pipefail
+          [ -f Dockerfile ] || { echo "Dockerfile not found at repo root" >&2; exit 1; }
           docker build --pull --build-arg "UPSTREAM_REF=${BASE}" --tag qwenproxy:candidate .
 
       - name: Fingerprint and compare with the deployed image
