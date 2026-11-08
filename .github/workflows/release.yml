@@ -1,172 +1,122 @@
 name: Build qwenproxy image
 
 on:
-  schedule:
-    - cron: "17 4 * * *"
+  push:
+    branches: ["main"]
   workflow_dispatch:
-    inputs:
-      ref:
-        description: "johngbl/qwenproxy ref (tag or branch); empty = latest release"
-        required: false
-        default: ""
-      force:
-        description: "Build a new tagged version even if the image is unchanged"
-        type: boolean
-        required: false
-        default: false
+  schedule:
+    - cron: "0 3 * * 1"
 
 permissions:
   contents: read
   packages: write
 
 concurrency:
-  group: build-qwenproxy
+  group: qwenproxy-image
   cancel-in-progress: false
 
-env:
-  UPSTREAM: johngbl/qwenproxy
-  IMAGE: qwenproxy
-
 jobs:
-  resolve:
-    name: Resolve upstream ref and next tag
-    runs-on: ubuntu-24.04
-    outputs:
-      ref: ${{ steps.ref.outputs.ref }}
-      tag: ${{ steps.next.outputs.tag }}
-      fingerprint: ${{ steps.fp.outputs.fingerprint }}
-      skip: ${{ steps.next.outputs.skip }}
-      owner_lc: ${{ steps.owner.outputs.owner_lc }}
+  build-push:
+    name: Build, fingerprint, push on change
+    runs-on: ubuntu-latest
     steps:
-      - name: Lowercase owner
-        id: owner
-        env:
-          OWNER: ${{ github.repository_owner }}
-        run: echo "owner_lc=${OWNER,,}" >> "$GITHUB_OUTPUT"
-
       - name: Checkout
-        uses: actions/checkout@v7.0.1
+        uses: actions/checkout@v7
 
-      - name: Resolve upstream ref
-        id: ref
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MANUAL_REF: ${{ inputs.ref }}
+      - name: Install skopeo
         run: |
-          if [ -n "$MANUAL_REF" ]; then
-            echo "ref=$MANUAL_REF" >> "$GITHUB_OUTPUT"
-            echo "Manual ref: $MANUAL_REF"
-            exit 0
-          fi
-          REF="$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name)"
-          if [ -z "$REF" ]; then
-            echo "No releases found in ${UPSTREAM}" >&2
-            exit 1
-          fi
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "Latest upstream release: $REF"
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y skopeo
 
-      - name: Compute build fingerprint
-        id: fp
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REF: ${{ steps.ref.outputs.ref }}
-        run: |
-          UPSTREAM_SHA="$(gh api "repos/${UPSTREAM}/commits/${REF}" --jq .sha)"
-          if [ -z "$UPSTREAM_SHA" ]; then
-            echo "Failed to resolve commit for ${UPSTREAM} ${REF}" >&2
-            exit 1
-          fi
-          DOCKERFILE_SHA="$(sha256sum docker/qwenproxy-slim/Dockerfile | cut -d' ' -f1)"
-          FINGERPRINT="$(printf '%s %s' "$UPSTREAM_SHA" "$DOCKERFILE_SHA" | sha256sum | cut -d' ' -f1)"
-          echo "fingerprint=$FINGERPRINT" >> "$GITHUB_OUTPUT"
-
-      - name: Login to GHCR
-        uses: docker/login-action@v4.8.0
+      - name: Login to GHCR (docker)
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve next tag suffix
-        id: next
-        env:
-          GH_TOKEN: ${{ github.token }}
-          OWNER: ${{ github.repository_owner }}
-          OWNER_LC: ${{ steps.owner.outputs.owner_lc }}
-          REF: ${{ steps.ref.outputs.ref }}
-          FINGERPRINT: ${{ steps.fp.outputs.fingerprint }}
-          FORCE: ${{ inputs.force }}
+      - name: Login to GHCR (skopeo)
+        run: skopeo login ghcr.io --username "${{ github.actor }}" --password "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Parse pinned version from compose
         run: |
-          OWNER_TYPE="$(gh api "users/${OWNER}" --jq .type)"
-          if [ "$OWNER_TYPE" = "Organization" ]; then
-            API_PATH="/orgs/${OWNER}/packages/container/${IMAGE}/versions"
+          set -euo pipefail
+          COMPOSE_FILE=$(ls compose.yaml compose.yml docker-compose.yaml docker-compose.yml 2>/dev/null | head -n 1)
+          [ -n "$COMPOSE_FILE" ] || { echo "compose file not found" >&2; exit 1; }
+          IMAGE_REF=$(grep -oE "ghcr\.io/[^\"'[:space:]]+" "$COMPOSE_FILE" | head -n 1)
+          [ -n "$IMAGE_REF" ] || { echo "ghcr.io image ref not found in $COMPOSE_FILE" >&2; exit 1; }
+          IMAGE="${IMAGE_REF%:*}"
+          BASE="${IMAGE_REF##*:}"
+          case "$BASE" in
+            v[0-9]*) ;;
+            *) echo "unexpected pinned tag: $BASE" >&2; exit 1 ;;
+          esac
+          {
+            echo "IMAGE=$IMAGE"
+            echo "BASE=$BASE"
+          } >> "$GITHUB_ENV"
+          echo "pinned by compose: ${IMAGE}:${BASE} (builds upstream ${BASE})"
+
+      - name: Build candidate
+        run: |
+          set -euo pipefail
+          docker build --pull --build-arg "UPSTREAM_REF=${BASE}" --tag qwenproxy:candidate .
+
+      - name: Fingerprint and compare with the deployed image
+        run: |
+          set -euo pipefail
+          fingerprint() {
+          docker run --rm -i --entrypoint /bin/sh "$1" <<'FPS'
+          dpkg-query -W -f='${binary:Package} ${Version}\n' | sort
+          node --version
+          npm --version
+          find /app /ms-playwright -type f -print0 | sort -z | xargs -0 sha256sum
+          FPS
+          }
+          NEW_FP=$(fingerprint qwenproxy:candidate | sha256sum | cut -d' ' -f1)
+          echo "NEW_FP=$NEW_FP" >> "$GITHUB_ENV"
+          if docker pull "${IMAGE}:${BASE}" >/dev/null 2>&1; then
+            OLD_FP=$(fingerprint "${IMAGE}:${BASE}" | sha256sum | cut -d' ' -f1)
           else
-            API_PATH="/user/packages/container/${IMAGE}/versions"
+            OLD_FP=""
+            echo "no deployed image at ${IMAGE}:${BASE} yet - first build"
           fi
-          LAST_N="$(gh api --paginate "$API_PATH" \
-            | jq -s --arg ref "$REF" '
-                add
-                | [ .[]
-                    | (.metadata.container.tags // [])[]
-                    | select(startswith($ref + "-"))
-                    | select((ltrimstr($ref + "-")) | test("^[0-9]+$"))
-                    | (ltrimstr($ref + "-") | tonumber)
-                  ]
-                | max // 0')"
-          if [ "$LAST_N" -eq 0 ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "tag=${REF}-1" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          IMAGE_REF="ghcr.io/${OWNER_LC}/${IMAGE}:${REF}-${LAST_N}"
-          LAST_FP="$(docker buildx imagetools inspect "$IMAGE_REF" --format '{{json .Image.Config.Labels}}' \
-            | jq -r '."org.opencontainers.image.revision" // ""')"
-          if [ "$FORCE" = "true" ] || [ "$LAST_FP" != "$FINGERPRINT" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "tag=${REF}-$((LAST_N + 1))" >> "$GITHUB_OUTPUT"
+          if [ -n "$OLD_FP" ] && [ "$NEW_FP" = "$OLD_FP" ]; then
+            echo "UNCHANGED=true" >> "$GITHUB_ENV"
+            echo "fingerprint ${NEW_FP:0:16}... identical to ${IMAGE}:${BASE} - no push, suffix not incremented"
           else
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "tag=${REF}-${LAST_N}" >> "$GITHUB_OUTPUT"
-            echo "Image ${IMAGE_REF} is identical to the current build - skipping"
+            echo "UNCHANGED=false" >> "$GITHUB_ENV"
+            echo "fingerprint changed: ${OLD_FP:0:16}... -> ${NEW_FP:0:16}..."
           fi
 
-  build:
-    name: Build and push
-    needs: resolve
-    if: ${{ needs.resolve.outputs.skip != 'true' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7.0.1
+      - name: Push with auto-incremented suffix
+        if: env.UNCHANGED == 'false'
+        run: |
+          set -euo pipefail
+          BASE_ESC=$(printf '%s' "$BASE" | sed 's/[.]/\\./g')
+          LAST=$(skopeo list-tags "docker://${IMAGE}" | jq -r '.Tags[]?' | grep -E "^${BASE_ESC}\.[0-9]+$" | sort -V | tail -n 1 || true)
+          if [ -n "$LAST" ]; then N=$(( ${LAST##*.} + 1 )); else N=1; fi
+          SUFFIXED="${IMAGE}:${BASE}.${N}"
+          docker tag qwenproxy:candidate "$SUFFIXED"
+          docker tag qwenproxy:candidate "${IMAGE}:${BASE}"
+          docker push "$SUFFIXED"
+          docker push "${IMAGE}:${BASE}"
+          {
+            echo "### qwenproxy image pushed"
+            echo ""
+            echo "- new immutable tag: \`${BASE}.${N}\`"
+            echo "- compose tag \`${BASE}\` updated to the same image"
+            echo "- fingerprint: \`${NEW_FP}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "pushed ${SUFFIXED}; ${IMAGE}:${BASE} now points to it"
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4.4.1
-
-      - name: Login to GHCR
-        uses: docker/login-action@v4.8.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v7.4.0
-        with:
-          context: .
-          file: docker/qwenproxy-slim/Dockerfile
-          push: true
-          platforms: linux/amd64
-          provenance: false
-          build-args: |
-            UPSTREAM_REF=${{ needs.resolve.outputs.ref }}
-          tags: |
-            ghcr.io/${{ needs.resolve.outputs.owner_lc }}/${{ env.IMAGE }}:${{ needs.resolve.outputs.tag }}
-          labels: |
-            org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.version=${{ needs.resolve.outputs.tag }}
-            org.opencontainers.image.revision=${{ needs.resolve.outputs.fingerprint }}
-            org.opencontainers.image.description=Built from ${{ env.UPSTREAM }} ${{ needs.resolve.outputs.ref }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Report skip
+        if: env.UNCHANGED == 'true'
+        run: |
+          {
+            echo "### qwenproxy image unchanged"
+            echo ""
+            echo "- built image is content-identical to \`${IMAGE}:${BASE}\`"
+            echo "- no push, suffix not incremented"
+          } >> "$GITHUB_STEP_SUMMARY"
