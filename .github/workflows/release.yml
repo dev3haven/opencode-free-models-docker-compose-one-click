@@ -88,6 +88,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
+      - name: Checkout
+        uses: actions/checkout@v7.0.1
+
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v4.4.1
 
@@ -101,10 +104,13 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v7.4.0
         with:
-          context: "https://github.com/${{ env.UPSTREAM }}.git#${{ needs.resolve.outputs.ref }}"
+          context: .
+          file: docker/qwenproxy-slim/Dockerfile
           push: true
           platforms: linux/amd64
           provenance: false
+          build-args: |
+            UPSTREAM_REF=${{ needs.resolve.outputs.ref }}
           tags: |
             ghcr.io/${{ needs.resolve.outputs.owner_lc }}/${{ env.IMAGE }}:${{ needs.resolve.outputs.ref }}
           labels: |
